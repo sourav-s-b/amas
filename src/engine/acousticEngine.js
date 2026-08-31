@@ -4,28 +4,41 @@ import ggwaveFactory from "@vpalmisano/ggwave";
 /**
  * @typedef {Object} AcousticTransceiverOptions
  * @property {number} [payloadLength=32]      Fixed payload length (must match sender/receiver)
- * @property {number} [freqStart=390]         MT_FASTEST start frequency bin (~18.3-19.8kHz)
+ * @property {number} [frequencyHz=18300]     Start frequency in Hz (converted internally to a ggwave bin index)
+ * @property {string} [protocol="MT_FASTEST"] ggwave protocol key, e.g. "MT_FASTEST", "ULTRASOUND_NORMAL", "AUDIBLE_NORMAL"
  * @property {number} [volume=10]             Send volume (0-100 as used by ggwave)
  * @property {string} [workletUrl="/audio-worklet-processor.js"]  Path to the AudioWorklet module
+ * @property {number} [samplesPerFrame=1024]  ggwave's FFT frame size, used only for the Hz<->bin conversion display
  * @property {(rms: number) => void} [onLevel]        Called on every mic frame with current RMS
  * @property {(message: string) => void} [onMessage]  Called when a payload is successfully decoded
  * @property {(message: string) => void} [onLog]      Called for human-readable status updates
  * @property {(error: Error) => void} [onError]       Called on recoverable errors
+ * @property {() => void} [onDecodeAttempt]           Called every time a mic frame is fed to the decoder (proof the RX pipeline is alive)
  */
 
+// ggwave's default FFT frame size. Real frequency of bin N is:
+//   hz = N * (sampleRateOut / samplesPerFrame)
+// This mirrors ggwave's own hzPerSample() convention. It's an approximation
+// tied to ggwave's default parameters — if you ever change samplesPerFrame
+// via getDefaultParameters(), pass the same value here so the Hz math stays honest.
+const DEFAULT_SAMPLES_PER_FRAME = 1024;
+const DEFAULT_FREQUENCY_HZ = 18300; // ~bin 390 at 48kHz, matches the old hardcoded default
 
 export class AcousticTransceiver {
     /** @param {AcousticTransceiverOptions} [options] */
     constructor(options = {}) {
         this.options = {
             payloadLength: 32,
-            freqStart: 390,
+            frequencyHz: DEFAULT_FREQUENCY_HZ,
+            protocol: "MT_FASTEST",
             volume: 10,
             workletUrl: "/audio-worklet-processor.js",
+            samplesPerFrame: DEFAULT_SAMPLES_PER_FRAME,
             onLevel: () => {},
             onMessage: () => {},
             onLog: () => {},
             onError: () => {},
+            onDecodeAttempt: () => {},
             ...options,
         };
 
@@ -43,12 +56,14 @@ export class AcousticTransceiver {
         this.rxInstance = null; // ggwave instance handle (can legitimately be 0)
 
         this._ready = null; // init() promise, memoized
+        this._sendLoopTimer = null;
+        this._sendLoopBusy = false;
     }
 
-    /** Update runtime-tunable options (payloadLength, freqStart, volume, callbacks, etc). */
+    /** Update runtime-tunable options (frequencyHz, protocol, volume, callbacks, etc). */
     configure(partialOptions) {
         Object.assign(this.options, partialOptions);
-        if (this.gg && partialOptions.freqStart !== undefined) {
+        if (this.gg && (partialOptions.frequencyHz !== undefined || partialOptions.protocol !== undefined)) {
             this._applyFreqStart();
         }
     }
@@ -69,31 +84,59 @@ export class AcousticTransceiver {
         return this._ready;
     }
 
-    _applyFreqStart() {
-        const id = this._getMtFastestProtocolId();
-        if (id == null) {
-            this.options.onLog(
-                "MT_FASTEST protocol not found on this ggwave build.",
-            );
-            return;
-        }
-        this.gg.txProtocolSetFreqStart?.(id, this.options.freqStart);
-        this.gg.rxProtocolSetFreqStart?.(id, this.options.freqStart);
+    /** Hz per ggwave bin at the given sample rate (defaults to the currently running context, else 48000). */
+    hzPerBin(sampleRate) {
+        const sr = sampleRate ?? this.pipelineCtx?.sampleRate ?? this.playbackCtx?.sampleRate ?? 48000;
+        return sr / this.options.samplesPerFrame;
     }
 
-    _getMtFastestProtocolId() {
-        const unified = this.gg.ProtocolId;
-        const legacy = this.gg.TxProtocolId;
-        return (
-            unified?.GGWAVE_PROTOCOL_MT_FASTEST ??
-            legacy?.GGWAVE_TX_PROTOCOL_MT_FASTEST ??
-            legacy?.GGWAVE_PROTOCOL_MT_FASTEST ??
-            null
-        );
+    /** Convert a Hz value to the nearest ggwave bin index at the given (or current) sample rate. */
+    hzToBin(hz, sampleRate) {
+        return Math.round(hz / this.hzPerBin(sampleRate));
+    }
+
+    /** Convert a ggwave bin index back to an approximate Hz value at the given (or current) sample rate. */
+    binToHz(bin, sampleRate) {
+        return Math.round(bin * this.hzPerBin(sampleRate));
+    }
+
+    _applyFreqStart() {
+        const id = this._getProtocolId();
+        if (id == null) {
+            this.options.onLog(`Protocol "${this.options.protocol}" not found on this ggwave build.`);
+            return;
+        }
+        const bin = this.hzToBin(this.options.frequencyHz);
+        this.gg.txProtocolSetFreqStart?.(id, bin);
+        this.gg.rxProtocolSetFreqStart?.(id, bin);
+    }
+
+    /** Enumerate protocols actually available on this ggwave build, e.g. [{key:"MT_FASTEST", id:11}, ...]. */
+    getAvailableProtocols() {
+        if (!this.gg) return [];
+        const unified = this.gg.ProtocolId || {};
+        const legacy = this.gg.TxProtocolId || {};
+        const source = Object.keys(unified).length ? unified : legacy;
+        const prefix = Object.keys(unified).length ? "GGWAVE_PROTOCOL_" : "GGWAVE_TX_PROTOCOL_";
+        return Object.keys(source)
+            .filter((k) => k.startsWith(prefix))
+            .map((k) => ({ key: k.replace(prefix, ""), id: source[k] }))
+            .sort((a, b) => a.id - b.id);
     }
 
     _getProtocolId() {
-        return this._getMtFastestProtocolId() ?? 1;
+        if (!this.gg) return null;
+        const unified = this.gg.ProtocolId;
+        const legacy = this.gg.TxProtocolId;
+        const key = this.options.protocol;
+        return (
+            unified?.[`GGWAVE_PROTOCOL_${key}`] ??
+            legacy?.[`GGWAVE_TX_PROTOCOL_${key}`] ??
+            legacy?.[`GGWAVE_PROTOCOL_${key}`] ??
+            unified?.GGWAVE_PROTOCOL_MT_FASTEST ??
+            legacy?.GGWAVE_TX_PROTOCOL_MT_FASTEST ??
+            1
+        );
     }
 
     /** Get (and cache) a mic MediaStream. Reused across start/stop so the OS/driver mic stays warm. */
@@ -118,6 +161,9 @@ export class AcousticTransceiver {
         this.pipelineCtx = new (window.AudioContext || window.webkitAudioContext)();
         await this.pipelineCtx.audioWorklet.addModule(this.options.workletUrl);
 
+        // Sample rate affects the Hz<->bin math, so re-apply freqStart once we know the real rate.
+        this._applyFreqStart();
+
         const stream = await this._getMicStream();
         this.pipelineSource = this.pipelineCtx.createMediaStreamSource(stream);
         this.pipelineNode = new AudioWorkletNode(this.pipelineCtx, "pcm-processor");
@@ -137,13 +183,15 @@ export class AcousticTransceiver {
         }
     }
 
-    /** Encode and play `payload` through the speakers. */
+    /** Encode and play `payload` through the speakers. Returns { durationMs } of the broadcast. */
     async send(payload) {
         await this.init();
 
         if (!this.playbackCtx) {
             this.playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
+        // Sample rate wasn't known for certain until the context existed; re-apply now.
+        this._applyFreqStart();
 
         const parameters = this.gg.getDefaultParameters();
         parameters.sampleRateInp = this.playbackCtx.sampleRate;
@@ -167,6 +215,8 @@ export class AcousticTransceiver {
                 waveform.byteOffset,
                 waveform.byteLength / 4,
             );
+            const durationMs = (floatSamples.length / this.playbackCtx.sampleRate) * 1000;
+
             const audioBuffer = this.playbackCtx.createBuffer(
                 1,
                 floatSamples.length,
@@ -179,9 +229,44 @@ export class AcousticTransceiver {
             source.connect(this.playbackCtx.destination);
             source.start(0);
 
-            this.options.onLog(`Playing "${payload}" through speakers.`);
+            this.options.onLog(
+                `Sent "${payload}" (${this.options.protocol}, ${Math.round(this.options.frequencyHz)}Hz, ${durationMs.toFixed(0)}ms).`,
+            );
+            return { durationMs };
         } finally {
             this.gg.free(instance);
+        }
+    }
+
+    /**
+     * Repeatedly send `payload` every `gapMs` after each broadcast finishes, until stopSendingLoop() is called.
+     * Useful for walking around a room with a second device to test decode range/reliability.
+     */
+    startSendingLoop(payload, gapMs = 1500) {
+        this.stopSendingLoop();
+        this._sendLoopBusy = true;
+
+        const tick = async () => {
+            if (!this._sendLoopBusy) return;
+            try {
+                const { durationMs } = await this.send(payload);
+                if (!this._sendLoopBusy) return;
+                this._sendLoopTimer = setTimeout(tick, durationMs + gapMs);
+            } catch (err) {
+                this.options.onError(err);
+                if (this._sendLoopBusy) {
+                    this._sendLoopTimer = setTimeout(tick, gapMs);
+                }
+            }
+        };
+        tick();
+    }
+
+    stopSendingLoop() {
+        this._sendLoopBusy = false;
+        if (this._sendLoopTimer) {
+            clearTimeout(this._sendLoopTimer);
+            this._sendLoopTimer = null;
         }
     }
 
@@ -198,17 +283,18 @@ export class AcousticTransceiver {
         parameters.sampleRateInp = this.pipelineCtx.sampleRate;
         parameters.sampleRateOut = this.pipelineCtx.sampleRate;
         parameters.payloadLength = this.options.payloadLength;
-        
+
         this.rxInstance = this.gg.init(parameters);
 
         this.pipelineNode.port.onmessage = (event) => {
             if (!this.isListening || this.rxInstance == null) return;
 
-            const inputData = event.data; 
+            const inputData = event.data;
             const rms = Math.sqrt(
                 inputData.reduce((s, v) => s + v * v, 0) / inputData.length,
             );
             this.options.onLevel(rms);
+            this.options.onDecodeAttempt();
 
             const bytes = new Uint8Array(
                 inputData.buffer,
@@ -246,6 +332,7 @@ export class AcousticTransceiver {
 
     /** Fully tear down — call on component unmount. */
     async destroy() {
+        this.stopSendingLoop();
         this.stopListening();
         this.mediaStream?.getTracks().forEach((t) => t.stop());
         if (this.pipelineCtx && this.pipelineCtx.state !== "closed") {
