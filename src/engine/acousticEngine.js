@@ -73,7 +73,7 @@ export class AcousticTransceiver {
         const id = this._getMtFastestProtocolId();
         if (id == null) {
             this.options.onLog(
-                "⚠️ MT_FASTEST protocol not found on this ggwave build.",
+                "MT_FASTEST protocol not found on this ggwave build.",
             );
             return;
         }
@@ -198,14 +198,13 @@ export class AcousticTransceiver {
         parameters.sampleRateInp = this.pipelineCtx.sampleRate;
         parameters.sampleRateOut = this.pipelineCtx.sampleRate;
         parameters.payloadLength = this.options.payloadLength;
-        // NOTE: ggwave instance handles are pool indices and legitimately start at 0 —
-        // never use truthiness (`!instance`) to check validity, always compare to null/undefined.
+        
         this.rxInstance = this.gg.init(parameters);
 
         this.pipelineNode.port.onmessage = (event) => {
             if (!this.isListening || this.rxInstance == null) return;
 
-            const inputData = event.data; // Float32Array
+            const inputData = event.data; 
             const rms = Math.sqrt(
                 inputData.reduce((s, v) => s + v * v, 0) / inputData.length,
             );
@@ -230,7 +229,6 @@ export class AcousticTransceiver {
         this.options.onLog("Listening for ultrasound...");
     }
 
-    /** Stop capturing/decoding. The mic and AudioContext stay alive for a fast restart. */
     stopListening() {
         if (!this.isListening) return;
 

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAcousticTransceiver } from "./engine/useTransciever";
 
 export default function App() {
@@ -15,11 +16,14 @@ export default function App() {
         volume: 10,
     });
 
+    const [input, setInput] = useState("");
+
+
     return (
         <div style={{ fontFamily: "sans-serif", padding: 16 }}>
             <h1>Ultrasound Transceiver</h1>
-
-            <button onClick={() => send("M")}>Send "M"</button>{" "}
+            <input onChange={(e) => setInput(e.target.value)}/>
+            <button onClick={() => send(input)}>Send {input}</button>{" "}
             <button onClick={isListening ? stopListening : startListening}>
                 {isListening ? "Stop Listening" : "Start Listening"}
             </button>
