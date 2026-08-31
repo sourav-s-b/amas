@@ -27,6 +27,11 @@ export default function App() {
         logs,
         messages,
         lastSendDurationMs,
+        isSending,
+        sendProgress,
+        sendTotalMs,
+        sendingPayload,
+        sampleRates,
         availableProtocols,
         startListening,
         stopListening,
@@ -47,7 +52,6 @@ export default function App() {
     const [volume, setVolume] = useState(10);
     const [protocol, setProtocol] = useState("MT_FASTEST");
     const [loopGapSec, setLoopGapSec] = useState(1.5);
-    const [sending, setSending] = useState(false);
 
     const logEndRef = useRef(null);
 
@@ -73,13 +77,8 @@ export default function App() {
         logEndRef.current?.scrollIntoView({ block: "nearest" });
     }, [logs]);
 
-    const handleSendOnce = async () => {
-        setSending(true);
-        try {
-            await send(payload);
-        } finally {
-            setSending(false);
-        }
+    const handleSendOnce = () => {
+        send(payload);
     };
 
     const handleToggleLoop = () => {
@@ -112,7 +111,19 @@ export default function App() {
                     <div className="strip-head">
                         <span className="strip-tag tag-tx">TX</span>
                         <h2>Transmit</h2>
+                        {sampleRates.playback != null && (
+                            <span className="ctx-rate mono">{sampleRates.playback} Hz</span>
+                        )}
                     </div>
+                    {sampleRates.pipeline != null &&
+                        sampleRates.playback != null &&
+                        sampleRates.pipeline !== sampleRates.playback && (
+                            <p className="rate-mismatch">
+                                ⚠️ Mic ({sampleRates.pipeline}Hz) and speaker ({sampleRates.playback}Hz) contexts
+                                disagree on this device — outgoing tones can end up detuned from the Hz shown below,
+                                worse at higher frequencies.
+                            </p>
+                        )}
 
                     <label className="field">
                         <span>Payload</span>
@@ -173,8 +184,8 @@ export default function App() {
                     </div>
 
                     <div className="button-row">
-                        <button className="btn btn-primary" onClick={handleSendOnce} disabled={sending || !ready}>
-                            {sending ? "Sending…" : "Send once"}
+                        <button className="btn btn-primary" onClick={handleSendOnce} disabled={!ready}>
+                            {isSending ? "Sending…" : "Send once"}
                         </button>
                         <button
                             className={`btn ${isSendingLoop ? "btn-danger" : "btn-secondary"}`}
@@ -196,11 +207,31 @@ export default function App() {
                         />
                     </label>
 
-                    {lastSendDurationMs != null && (
-                        <p className="readout">
-                            Last broadcast took <strong>{lastSendDurationMs.toFixed(0)}ms</strong>
+                    <div className="send-progress-block">
+                        <div className="send-progress-labels">
+                            <span>
+                                {isSending
+                                    ? `Broadcasting "${sendingPayload}"`
+                                    : lastSendDurationMs != null
+                                      ? "Last broadcast"
+                                      : "No broadcast yet"}
+                            </span>
+                            <span className="mono">{Math.round(sendProgress * 100)}%</span>
+                        </div>
+                        <div className="send-progress-track">
+                            <div
+                                className={`send-progress-fill ${isSending ? "" : "send-progress-fill-idle"}`}
+                                style={{ width: `${Math.round(sendProgress * 100)}%` }}
+                            />
+                        </div>
+                        <p className="hint">
+                            {isSending
+                                ? `${Math.round(sendProgress * sendTotalMs)}ms / ${sendTotalMs.toFixed(0)}ms — changing frequency or protocol will stop this broadcast; volume updates live.`
+                                : lastSendDurationMs != null
+                                  ? `Last broadcast took ${lastSendDurationMs.toFixed(0)}ms.`
+                                  : "Send a payload to see its transmission progress here."}
                         </p>
-                    )}
+                    </div>
                 </section>
 
                 {/* RX CHANNEL */}
@@ -208,6 +239,9 @@ export default function App() {
                     <div className="strip-head">
                         <span className="strip-tag tag-rx">RX</span>
                         <h2>Receive</h2>
+                        {sampleRates.pipeline != null && (
+                            <span className="ctx-rate mono">{sampleRates.pipeline} Hz</span>
+                        )}
                     </div>
 
                     <button

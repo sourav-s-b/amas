@@ -24,6 +24,11 @@ import ggwaveFactory from "@vpalmisano/ggwave";
 const DEFAULT_SAMPLES_PER_FRAME = 1024;
 const DEFAULT_FREQUENCY_HZ = 18300; // ~bin 390 at 48kHz, matches the old hardcoded default
 
+// We always encode at this fixed ggwave "volume" and do real volume control with a
+// Web Audio GainNode instead. That's what lets the volume slider apply live, mid-broadcast,
+// without re-encoding the waveform (frequency/protocol changes still require re-encoding).
+const ENCODE_BASELINE_VOLUME = 50;
+
 export class AcousticTransceiver {
     /** @param {AcousticTransceiverOptions} [options] */
     constructor(options = {}) {
@@ -39,6 +44,11 @@ export class AcousticTransceiver {
             onLog: () => {},
             onError: () => {},
             onDecodeAttempt: () => {},
+            onSendStart: () => {},
+            onSendProgress: () => {},
+            onSendEnd: () => {},
+            onSendInterrupted: () => {},
+            onSampleRates: () => {},
             ...options,
         };
 
@@ -58,13 +68,70 @@ export class AcousticTransceiver {
         this._ready = null; // init() promise, memoized
         this._sendLoopTimer = null;
         this._sendLoopBusy = false;
+
+        this.playbackGain = null;
+        this._currentSource = null;
+        this._sendProgressRAF = null;
+        this._currentPayload = null;
     }
 
     /** Update runtime-tunable options (frequencyHz, protocol, volume, callbacks, etc). */
     configure(partialOptions) {
+        const changesFreqOrProtocol =
+            partialOptions.frequencyHz !== undefined || partialOptions.protocol !== undefined;
+        const changesVolume = partialOptions.volume !== undefined;
+
         Object.assign(this.options, partialOptions);
-        if (this.gg && (partialOptions.frequencyHz !== undefined || partialOptions.protocol !== undefined)) {
-            this._applyFreqStart();
+
+        // Volume is applied live via the GainNode — no need to interrupt anything in flight.
+        if (changesVolume && this.playbackGain) {
+            this.playbackGain.gain.value = this._volumeToGain(this.options.volume);
+        }
+
+        if (changesFreqOrProtocol) {
+            // This reapplies freqStart against whichever context currently exists, purely so
+            // getAvailableProtocols()/logs reflect the new value immediately. It is NOT what makes
+            // TX/RX correct — send() and startListening() each reapply it with their own context's
+            // exact sample rate right before use, which is what actually matters.
+            if (this.gg) {
+                this._applyFreqStart(this.playbackCtx?.sampleRate ?? this.pipelineCtx?.sampleRate);
+            }
+            // Frequency/protocol changes affect how the waveform is encoded, so a signal
+            // already playing (or queued in the sending loop) is now stale. Stop it rather
+            // than let a half-old, half-new tone go out the speaker.
+            const wasActive = !!this._currentSource || this._sendLoopBusy;
+            if (wasActive) {
+                const wasLooping = this._sendLoopBusy;
+                this._stopCurrentSource();
+                this.stopSendingLoop();
+                this.options.onLog(
+                    `${partialOptions.frequencyHz !== undefined ? "Frequency" : "Protocol"} changed — stopped ${
+                        wasLooping ? "sending loop" : "active transmission"
+                    }.`,
+                );
+                this.options.onSendInterrupted();
+            }
+        }
+    }
+
+    /** Map the 0-100 UI volume slider to a GainNode value (0-2x, since encode uses a fixed baseline). */
+    _volumeToGain(volume) {
+        return Math.max(0, volume / 50);
+    }
+
+    /**
+     * Surface the mic (pipelineCtx) and speaker (playbackCtx) sample rates to the UI, and warn
+     * loudly if they differ — that mismatch is exactly what can detune TX relative to what RX is
+     * listening for, especially at higher frequencies. Call this whenever either context is created.
+     */
+    _reportSampleRates() {
+        const pipeline = this.pipelineCtx?.sampleRate ?? null;
+        const playback = this.playbackCtx?.sampleRate ?? null;
+        this.options.onSampleRates({ pipeline, playback });
+        if (pipeline != null && playback != null && pipeline !== playback) {
+            this.options.onLog(
+                `⚠️ Mic (${pipeline}Hz) and speaker (${playback}Hz) contexts are running at different sample rates on this device. This can detune outgoing tones — most noticeably at higher frequencies.`,
+            );
         }
     }
 
@@ -84,29 +151,39 @@ export class AcousticTransceiver {
         return this._ready;
     }
 
-    /** Hz per ggwave bin at the given sample rate (defaults to the currently running context, else 48000). */
+    /** Hz per ggwave bin at the given sample rate. Always pass an explicit rate from the call site
+     *  that's about to use it — TX must use playbackCtx.sampleRate, RX must use pipelineCtx.sampleRate.
+     *  Falling back silently between the two is what caused TX/RX to disagree on frequency. */
     hzPerBin(sampleRate) {
-        const sr = sampleRate ?? this.pipelineCtx?.sampleRate ?? this.playbackCtx?.sampleRate ?? 48000;
+        const sr = sampleRate ?? 48000;
         return sr / this.options.samplesPerFrame;
     }
 
-    /** Convert a Hz value to the nearest ggwave bin index at the given (or current) sample rate. */
+    /** Convert a Hz value to the nearest ggwave bin index at the given sample rate. */
     hzToBin(hz, sampleRate) {
         return Math.round(hz / this.hzPerBin(sampleRate));
     }
 
-    /** Convert a ggwave bin index back to an approximate Hz value at the given (or current) sample rate. */
+    /** Convert a ggwave bin index back to an approximate Hz value at the given sample rate. */
     binToHz(bin, sampleRate) {
         return Math.round(bin * this.hzPerBin(sampleRate));
     }
 
-    _applyFreqStart() {
+    /**
+     * Set ggwave's freqStart for the requested Hz, at `sampleRate`.
+     * freqStart is a GLOBAL setting in the ggwave module (shared by every TX/RX instance), so
+     * this must be called with the sample rate of whichever context is about to actually run —
+     * playbackCtx.sampleRate right before send(), pipelineCtx.sampleRate right before listen().
+     * Calling it with the wrong context's rate is exactly what silently detunes the broadcast.
+     */
+    _applyFreqStart(sampleRate) {
         const id = this._getProtocolId();
         if (id == null) {
             this.options.onLog(`Protocol "${this.options.protocol}" not found on this ggwave build.`);
             return;
         }
-        const bin = this.hzToBin(this.options.frequencyHz);
+        const sr = sampleRate ?? 48000;
+        const bin = this.hzToBin(this.options.frequencyHz, sr);
         this.gg.txProtocolSetFreqStart?.(id, bin);
         this.gg.rxProtocolSetFreqStart?.(id, bin);
     }
@@ -162,7 +239,9 @@ export class AcousticTransceiver {
         await this.pipelineCtx.audioWorklet.addModule(this.options.workletUrl);
 
         // Sample rate affects the Hz<->bin math, so re-apply freqStart once we know the real rate.
-        this._applyFreqStart();
+        // This must use pipelineCtx's own rate — it's about to be the rate passed to gg.init() below.
+        this._applyFreqStart(this.pipelineCtx.sampleRate);
+        this._reportSampleRates();
 
         const stream = await this._getMicStream();
         this.pipelineSource = this.pipelineCtx.createMediaStreamSource(stream);
@@ -183,15 +262,27 @@ export class AcousticTransceiver {
         }
     }
 
-    /** Encode and play `payload` through the speakers. Returns { durationMs } of the broadcast. */
+    /**
+     * Encode and play `payload` through the speakers. Returns { durationMs } of the broadcast.
+     * Fires onSendStart/onSendProgress/onSendEnd as it plays so the UI can render a progress bar.
+     * If a transmission is already in flight, it's cut off in favor of this new one.
+     */
     async send(payload) {
         await this.init();
 
         if (!this.playbackCtx) {
             this.playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+            this.playbackGain = this.playbackCtx.createGain();
+            this.playbackGain.gain.value = this._volumeToGain(this.options.volume);
+            this.playbackGain.connect(this.playbackCtx.destination);
+            this._reportSampleRates();
         }
         // Sample rate wasn't known for certain until the context existed; re-apply now.
-        this._applyFreqStart();
+        // Must use playbackCtx's own rate — it's what gg.init() below is told a moment later.
+        // (Previously this silently picked up pipelineCtx's rate instead when the mic pipeline
+        // was already warmed up, so TX could be detuned from the requested Hz — worse at higher
+        // frequencies, which is why 19kHz was hit hardest.)
+        this._applyFreqStart(this.playbackCtx.sampleRate);
 
         const parameters = this.gg.getDefaultParameters();
         parameters.sampleRateInp = this.playbackCtx.sampleRate;
@@ -199,12 +290,13 @@ export class AcousticTransceiver {
         parameters.payloadLength = this.options.payloadLength;
 
         const instance = this.gg.init(parameters);
+        let audioBuffer, durationMs;
         try {
             const waveform = this.gg.encode(
                 instance,
                 payload,
                 this._getProtocolId(),
-                this.options.volume,
+                ENCODE_BASELINE_VOLUME,
             );
             if (!waveform) {
                 throw new Error("Failed to encode payload.");
@@ -215,26 +307,83 @@ export class AcousticTransceiver {
                 waveform.byteOffset,
                 waveform.byteLength / 4,
             );
-            const durationMs = (floatSamples.length / this.playbackCtx.sampleRate) * 1000;
+            durationMs = (floatSamples.length / this.playbackCtx.sampleRate) * 1000;
 
-            const audioBuffer = this.playbackCtx.createBuffer(
+            audioBuffer = this.playbackCtx.createBuffer(
                 1,
                 floatSamples.length,
                 this.playbackCtx.sampleRate,
             );
             audioBuffer.getChannelData(0).set(floatSamples);
-
-            const source = this.playbackCtx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(this.playbackCtx.destination);
-            source.start(0);
-
-            this.options.onLog(
-                `Sent "${payload}" (${this.options.protocol}, ${Math.round(this.options.frequencyHz)}Hz, ${durationMs.toFixed(0)}ms).`,
-            );
-            return { durationMs };
         } finally {
             this.gg.free(instance);
+        }
+
+        // Cut off whatever was still playing so we never overlap two transmissions.
+        this._stopCurrentSource();
+
+        const source = this.playbackCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(this.playbackGain);
+        this.playbackGain.gain.value = this._volumeToGain(this.options.volume);
+
+        this._currentSource = source;
+        this._currentPayload = payload;
+
+        source.onended = () => {
+            if (this._currentSource === source) this._currentSource = null;
+            this._stopSendProgressTracking();
+            this.options.onSendProgress(1);
+            this.options.onSendEnd();
+        };
+
+        const startedAt = this.playbackCtx.currentTime;
+        source.start(0);
+
+        this.options.onSendStart(durationMs, payload);
+        this._trackSendProgress(startedAt, durationMs / 1000);
+
+        this.options.onLog(
+            `Sending "${payload}" (${this.options.protocol}, ${Math.round(this.options.frequencyHz)}Hz, ${durationMs.toFixed(0)}ms).`,
+        );
+        return { durationMs };
+    }
+
+    /** Stop whatever is currently playing (used before starting a new send, or on interrupt). */
+    _stopCurrentSource() {
+        if (this._currentSource) {
+            try {
+                this._currentSource.onended = null;
+                this._currentSource.stop();
+            } catch {
+                // already stopped/ended — fine to ignore
+            }
+            this._currentSource = null;
+        }
+        this._stopSendProgressTracking();
+    }
+
+    /** Drive onSendProgress(0..1) every animation frame for the duration of the current broadcast. */
+    _trackSendProgress(startedAt, durationSec) {
+        this._stopSendProgressTracking();
+        const tick = () => {
+            if (!this.playbackCtx) return;
+            const elapsed = this.playbackCtx.currentTime - startedAt;
+            const frac = durationSec > 0 ? Math.min(1, elapsed / durationSec) : 1;
+            this.options.onSendProgress(frac);
+            if (frac < 1) {
+                this._sendProgressRAF = requestAnimationFrame(tick);
+            } else {
+                this._sendProgressRAF = null;
+            }
+        };
+        this._sendProgressRAF = requestAnimationFrame(tick);
+    }
+
+    _stopSendProgressTracking() {
+        if (this._sendProgressRAF != null) {
+            cancelAnimationFrame(this._sendProgressRAF);
+            this._sendProgressRAF = null;
         }
     }
 
@@ -278,6 +427,10 @@ export class AcousticTransceiver {
         if (this.pipelineCtx.state === "suspended") {
             await this.pipelineCtx.resume();
         }
+
+        // freqStart is a global setting shared with TX — a send() in between could have left it
+        // pointed at playbackCtx's rate. Reassert it for pipelineCtx's rate right before decoding.
+        this._applyFreqStart(this.pipelineCtx.sampleRate);
 
         const parameters = this.gg.getDefaultParameters();
         parameters.sampleRateInp = this.pipelineCtx.sampleRate;
@@ -333,6 +486,7 @@ export class AcousticTransceiver {
     /** Fully tear down — call on component unmount. */
     async destroy() {
         this.stopSendingLoop();
+        this._stopCurrentSource();
         this.stopListening();
         this.mediaStream?.getTracks().forEach((t) => t.stop());
         if (this.pipelineCtx && this.pipelineCtx.state !== "closed") {
@@ -341,6 +495,7 @@ export class AcousticTransceiver {
         if (this.playbackCtx && this.playbackCtx.state !== "closed") {
             await this.playbackCtx.close();
         }
+        this.playbackGain = null;
         this.pipelineReady = false;
     }
 }

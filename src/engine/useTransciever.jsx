@@ -19,6 +19,11 @@ export function useAcousticTransceiver(options = {}) {
     const [messages, setMessages] = useState([]);
     const [lastMessage, setLastMessage] = useState(null);
     const [lastSendDurationMs, setLastSendDurationMs] = useState(null);
+    const [isSending, setIsSending] = useState(false);
+    const [sendProgress, setSendProgress] = useState(0); // 0..1, fraction of current broadcast played so far
+    const [sendTotalMs, setSendTotalMs] = useState(0);
+    const [sendingPayload, setSendingPayload] = useState(null);
+    const [sampleRates, setSampleRates] = useState({ pipeline: null, playback: null });
     const [availableProtocols, setAvailableProtocols] = useState([]);
     const [ready, setReady] = useState(false);
 
@@ -42,6 +47,22 @@ export function useAcousticTransceiver(options = {}) {
             onError: (err) =>
                 setLogs((prev) => [...prev.slice(-199), { text: `Error: ${err.message}`, at: Date.now(), isError: true }]),
             onDecodeAttempt: () => setDecodeAttempts((prev) => prev + 1),
+            onSendStart: (durationMs, payload) => {
+                setIsSending(true);
+                setSendProgress(0);
+                setSendTotalMs(durationMs);
+                setSendingPayload(payload);
+            },
+            onSendProgress: (frac) => setSendProgress(frac),
+            onSendEnd: () => setIsSending(false),
+            onSendInterrupted: () => {
+                // Frequency/protocol changed mid-broadcast — engine already stopped playback
+                // and any sending loop, so reflect that in the UI immediately.
+                setIsSending(false);
+                setIsSendingLoop(false);
+                setSendProgress(0);
+            },
+            onSampleRates: (rates) => setSampleRates(rates),
         });
         transceiverRef.current = transceiver;
 
@@ -103,6 +124,11 @@ export function useAcousticTransceiver(options = {}) {
         messages,
         lastMessage,
         lastSendDurationMs,
+        isSending,
+        sendProgress,
+        sendTotalMs,
+        sendingPayload,
+        sampleRates,
         availableProtocols,
         startListening,
         stopListening,
